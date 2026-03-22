@@ -530,7 +530,7 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, rope_base: float, qk_gain_init: float,
-                 use_xsa: bool = False, rope_frac: float = 1.0):
+                 **kwargs):
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError("model_dim must be divisible by num_heads")
@@ -541,8 +541,6 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
-        self.use_xsa = use_xsa
-        self.rope_dim = max(2, int(self.head_dim * rope_frac) // 2 * 2)
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -550,7 +548,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.rope_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor, q_delta=None, v_delta=None) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -563,25 +561,13 @@ class CausalSelfAttention(nn.Module):
         q = F.rms_norm(q, (q.size(-1),))
         k = F.rms_norm(k, (k.size(-1),))
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
-        rd = self.rope_dim
-        if rd < self.head_dim:
-            q_rope = apply_rotary_emb(q[..., :rd], cos, sin)
-            k_rope = apply_rotary_emb(k[..., :rd], cos, sin)
-            q = torch.cat([q_rope, q[..., rd:]], dim=-1)
-            k = torch.cat([k_rope, k[..., rd:]], dim=-1)
-        else:
-            q = apply_rotary_emb(q, cos, sin)
-            k = apply_rotary_emb(k, cos, sin)
+        q = apply_rotary_emb(q, cos, sin)
+        k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q, k, v, attn_mask=None, is_causal=True,
             enable_gqa=(self.num_kv_heads != self.num_heads),
         )
-        if self.use_xsa:
-            v_expanded = v.repeat_interleave(self.num_heads // self.num_kv_heads, dim=1)
-            dot = (y * v_expanded).sum(dim=-1, keepdim=True)
-            v_norm_sq = (v_expanded * v_expanded).sum(dim=-1, keepdim=True).clamp_min(1e-12)
-            y = y - (dot / v_norm_sq) * v_expanded
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -640,12 +626,11 @@ class BigramHashEmbedding(nn.Module):
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float,
-                 use_xsa: bool = False, rope_frac: float = 1.0):
+                 **kwargs):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
-                                        use_xsa=use_xsa, rope_frac=rope_frac)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -679,8 +664,6 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
-        xsa_layers: int = 4,
-        rope_frac: float = 0.25,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -697,9 +680,8 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                      use_xsa=(i >= num_layers - xsa_layers), rope_frac=rope_frac)
-                for i in range(num_layers)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+                for _ in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -1183,8 +1165,6 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-        xsa_layers=args.xsa_layers,
-        rope_frac=args.rope_frac,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1463,10 +1443,33 @@ def main() -> None:
     deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
     base_model.load_state_dict(deq_state, strict=True)
 
+    # Sliding window eval on int6-roundtripped weights (baseline score)
+    torch.cuda.synchronize()
+    t_qeval = time.perf_counter()
+    if args.eval_stride > 0 and args.eval_stride < args.train_seq_len:
+        log0(f"final_eval_mode:sliding_window stride:{args.eval_stride} batch_seqs:{args.eval_batch_seqs}")
+        sw_val_loss, sw_val_bpb = eval_val_sliding(
+            args, base_model, rank, world_size, device,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+            stride=args.eval_stride, batch_seqs=args.eval_batch_seqs,
+        )
+    else:
+        log0("final_eval_mode:standard")
+        sw_val_loss, sw_val_bpb = eval_val(
+            args, base_model, rank, world_size, device, grad_accum_steps,
+            val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+        )
+    torch.cuda.synchronize()
+    log0(
+        f"final_sliding_roundtrip val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+    )
+    log0(f"final_sliding_roundtrip_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
     # LoRA TTT evaluation on int6-roundtripped weights
     torch._dynamo.reset()
     torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
+    t_ttt = time.perf_counter()
     log0(f"final_eval_mode:ttt_lora rank:{args.ttt_lora_rank} lr:{args.ttt_lora_lr} "
          f"chunk:{args.ttt_chunk_size} seq:{args.ttt_eval_seq_len} batch:{args.ttt_batch_size}")
     q_val_loss, q_val_bpb = eval_val_ttt_lora(
@@ -1476,7 +1479,7 @@ def main() -> None:
     torch.cuda.synchronize()
     log0(
         f"final_ttt_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+        f"eval_time:{1000.0 * (time.perf_counter() - t_ttt):.0f}ms"
     )
     log0(f"final_ttt_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
