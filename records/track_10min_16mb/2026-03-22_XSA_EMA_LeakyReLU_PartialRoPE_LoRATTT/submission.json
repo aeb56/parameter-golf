@@ -1,0 +1,13 @@
+{
+  "name": "XSA + EMA + LeakyReLU^2 + Partial RoPE + LoRA TTT",
+  "author": "aeb56",
+  "github_id": "aeb56",
+  "val_bpb": null,
+  "date": "2026-03-22",
+  "summary": "10L int5/int6 SmearGate BigramHash base with XSA (last 4 layers), EMA (decay=0.997), LeakyReLU(0.5)^2, Partial RoPE (25%), and causal LoRA TTT evaluation",
+  "training_time_seconds": null,
+  "eval_time_seconds": null,
+  "num_gpus": 8,
+  "gpu_type": "H100 SXM",
+  "artifact_bytes": null
+}
